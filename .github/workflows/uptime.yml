@@ -1,0 +1,77 @@
+# Free uptime monitor: every 10 minutes checks the five Phone Club sites, the API (and that it
+# can read the database) and how long the HTTPS certificates have left. When something is down
+# the run fails and GitHub emails the repo owner (Settings → Notifications → Actions).
+# Lives in its own public repo because public repos have unlimited free Actions minutes; it holds
+# no secrets, only the public addresses.
+name: Uptime
+
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write # only for the keep-alive commit below
+
+concurrency:
+  group: uptime
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Sites and API
+        run: |
+          # name|url|text the answer must contain
+          checks='
+          Shop|https://phoneclub.in/|<div id="root">
+          Sell site|https://sell.phoneclub.in/|<div id="root">
+          Logistics|https://logistics.phoneclub.in/|<div id="root">
+          Admin|https://admin.phoneclub.in/|<div id="root">
+          Sell admin|https://selladmin.phoneclub.in/|<div id="root">
+          API|https://api.phoneclub.in/api/health|"success":true
+          Database|https://api.phoneclub.in/api/categories|"success":true
+          '
+          failed=0
+          while IFS='|' read -r name url want; do
+            name=$(echo "$name" | xargs); [ -z "$name" ] && continue
+            ok=0
+            # Three tries 20 s apart, so a single slow answer is not an alarm.
+            for try in 1 2 3; do
+              body=$(curl -s --max-time 20 -w '\n%{http_code} %{time_total}' "$url" || true)
+              code=$(echo "$body" | tail -1 | cut -d' ' -f1); secs=$(echo "$body" | tail -1 | cut -d' ' -f2)
+              if [ "$code" = "200" ] && echo "$body" | grep -qF "$want"; then ok=1; break; fi
+              sleep 20
+            done
+            if [ $ok = 1 ]; then echo "OK    $name (${secs}s)"; else echo "::error::DOWN  $name  $url  (HTTP $code)"; failed=1; fi
+          done <<< "$checks"
+          exit $failed
+
+      - name: HTTPS certificates
+        if: always()
+        run: |
+          failed=0
+          for host in phoneclub.in sell.phoneclub.in logistics.phoneclub.in admin.phoneclub.in selladmin.phoneclub.in api.phoneclub.in; do
+            end=$(echo | openssl s_client -connect "$host:443" -servername "$host" 2>/dev/null | openssl x509 -noout -enddate 2>/dev/null | cut -d= -f2)
+            if [ -z "$end" ]; then echo "::error::$host: could not read the certificate"; failed=1; continue; fi
+            days=$(( ($(date -d "$end" +%s) - $(date +%s)) / 86400 ))
+            if [ "$days" -lt 14 ]; then echo "::error::$host: certificate ends in $days days ($end)"; failed=1; else echo "OK    $host certificate: $days days left"; fi
+          done
+          exit $failed
+
+      # GitHub pauses scheduled runs in repos with no commits for 60 days: an empty commit
+      # every ~50 days keeps this monitor running.
+      - name: Keep the schedule alive
+        if: always()
+        uses: actions/checkout@v4
+      - if: always()
+        run: |
+          last=$(git log -1 --format=%ct)
+          if [ $(( ($(date +%s) - last) / 86400 )) -ge 50 ]; then
+            git config user.name "uptime-bot"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git commit --allow-empty -m "Keep the uptime schedule active"
+            git push
+          fi
